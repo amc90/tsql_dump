@@ -4,7 +4,7 @@ use strict;
 
 use DBI;
 use DBD::Sybase;
-use constant DEBUG => 1;
+use constant DEBUG => 0;
 my %blacklisted_dbs=map {$_=>1} qw(msdb distribution master tempdb model);
 
 if ($#ARGV!=1) {
@@ -24,12 +24,16 @@ connect_file will look something like:
 EOF
 	exit 1
 }
+
+die "Expected tsql_dump to be run by tsql_dump user" unless getpwuid( $< ) eq "tsql_dump";
+
 my $connect_info=$ARGV[0];
 my $target_folder=$ARGV[1];
 die "$connect_info should be a file containing DBI info" unless -e $connect_info;
 die "$connect_info should have permission 600" unless 0600==(((stat($connect_info))[2])&07777);
 die "$target_folder should be a git repository to contain object dumps"
 	unless -d "$target_folder/.git";
+system("cd $target_folder&&/usr/bin/git pull --quiet")==0 or die "Failed to pull from git - $?, $!";
 
 open CONNECT_INFO, $connect_info or die "Can't open file: $!";
 my %ci=();
@@ -56,7 +60,8 @@ foreach(grep(!defined $blacklisted_dbs{$_}, @db_list)) {
 	dump_db($_, $dbh, "$target_folder/$_");
 }
 
-do_git($target_folder);
+chdir $target_folder;
+do_git();
 
 print "Clean exit\n" if DEBUG;
 exit 0;
@@ -143,8 +148,21 @@ sub delete_nonmatching_sql_files {
 }
 
 sub do_git {
-	chdir shift;
-	system("/usr/bin/git", "add", ".")==0 or die "Failed to add to git - $?, $!";
-	
+	die "do_git expects to be called in the top level of a repository"
+		unless -d ".git";
+
+	system("/usr/bin/git add . -A")==0 or die "Failed to add to git - $?, $!";
+	system("/usr/bin/git diff-index --quiet HEAD --");
+	if($? == -1 || $? & 127) {
+		die "Failed checking diff-index $? $!";
+	}
+	if($? >> 8) {
+		print "Committing and pushing\n" if DEBUG;
+		system("/usr/bin/git", "commit", "--message=Automated commit", "--quiet")==0 or die "Failed to commit to git - $?, $!";
+		system("/usr/bin/git push --quiet")==0 or die "Failed to push to git - $?, $!";
+	} else {
+		print "No changes - no need to commit/push\n" if DEBUG;
+	}
+	system("/usr/bin/git pull --quiet")==0 or die "Failed to pull from git - $?, $!";
 }
 
