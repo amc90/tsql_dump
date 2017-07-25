@@ -1,0 +1,150 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use DBI;
+use DBD::Sybase;
+use constant DEBUG => 1;
+my %blacklisted_dbs=map {$_=>1} qw(msdb distribution master tempdb model);
+
+if ($#ARGV!=1) {
+	print STDERR <<"EOF";
+tsql-dump <connect_file> <target folder>
+
+where:
+	connect_file    is a file containing DBI connection info
+	target_folder   is a folder to populate with object dumps
+
+connect_file will look something like:
+
+	server=dbi:ODBC:Driver=/usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so;Server=MYSERVER.EXAMPLE.COM;Port=1433;TDS_Version=8.0
+	user=tsqldump
+	password=MYPASSWORD
+
+EOF
+	exit 1
+}
+my $connect_info=$ARGV[0];
+my $target_folder=$ARGV[1];
+die "$connect_info should be a file containing DBI info" unless -e $connect_info;
+die "$connect_info should have permission 600" unless 0600==(((stat($connect_info))[2])&07777);
+die "$target_folder should be a git repository to contain object dumps"
+	unless -d "$target_folder/.git";
+
+open CONNECT_INFO, $connect_info or die "Can't open file: $!";
+my %ci=();
+while (<CONNECT_INFO>) {
+	chomp;
+	next unless /^[[:space:]]*[^#]*=/;
+	my ($k, $v) = split /=/, $_, 2;
+	next unless $k and $v;
+	$ci{$k}=$v;
+}
+close CONNECT_INFO;
+die "$connect_info should contain server=,user=, and password= lines" unless $ci{"server"} and $ci{"user"} and $ci{"password"};
+print "Connected as $ci{user} on $ci{server}\n" if DEBUG;
+
+my $dbh=DBI->connect($ci{"server"}, $ci{"user"}, $ci{"password"}) or die "Failed connecting to db: ".DBI->errstr;
+
+#Silently truncate long reads?
+$dbh->{'LongTruncOk'} = 0;
+#Maximum read length.
+$dbh->{'LongReadLen'} = 200000;
+
+my @db_list=@{$dbh->selectcol_arrayref("SELECT name FROM master.dbo.sysdatabases")};
+foreach(grep(!defined $blacklisted_dbs{$_}, @db_list)) {
+	dump_db($_, $dbh, "$target_folder/$_");
+}
+
+do_git($target_folder);
+
+print "Clean exit\n" if DEBUG;
+exit 0;
+
+#Arg 1 is db name to dump
+#Arg 2 is a handle to an open database
+#Arg 3 is the target folder for this database to populate with SQL information
+sub dump_db {
+	my ($db_name, $dbh, $target_folder)=@_;
+	$db_name =~ /^[-_A-Za-z0-9]*$/ or die "Unexpected interesting characters in DB name $db_name";
+	print "Called dump_db on $db_name into $target_folder\n" if DEBUG;
+	(-d $target_folder) or
+		mkdir $target_folder or
+		die "Failed to create $target_folder $!";
+	$dbh->do("use $db_name;") or die "Failed to change db to $db_name";
+	my $sth = $dbh->prepare(<<'EOF')
+SELECT name, type_desc, definition
+FROM sys.objects o
+LEFT JOIN sys.sql_modules c
+ON c.object_id=o.object_id
+WHERE type NOT IN ('U', 'S', 'PK', 'IT', 'UQ', 'SQ', 'D', 'F')
+AND name NOT LIKE '_dta_%'
+AND name NOT LIKE 'sp_MS%'
+AND name NOT LIKE 'sp_%'
+AND definition IS NOT NULL
+;
+EOF
+		or die "Couldn't prepare statement: " . $dbh->errstr;
+	$sth->execute();
+
+	my %files_referenced=();
+	while(my @data=$sth->fetchrow_array()) {
+		print "LINE READ: $db_name, @data\n" if DEBUG>=9;
+
+		foreach(0,1) {
+			$data[$_] =~ /^[-_A-Za-z0-9]*$/ or die "Interesting characters in $db_name, data[$_] entry: $data[$_]";
+		}
+
+		my $obj_folder="$target_folder/$data[1]";
+		my $file_name="$obj_folder/$data[0].sql";
+		$files_referenced{"$data[1]/$data[0].sql"}=1;
+		(-d $obj_folder) or
+			mkdir $obj_folder or
+			die "Failed to create $obj_folder";
+		my $old_file_content="";
+		if (-f $file_name ) {
+			local $/ = undef;
+			open(my $fh, $file_name) or die "Failed open $file_name $!";
+			$old_file_content=<$fh>;
+			close $fh or warn "Error closing $file_name: $!";
+		}
+		if($data[2] ne $old_file_content) {
+			print "Writing $file_name\n" if DEBUG;
+			open(my $fh, '>', $file_name) or die "Failed open $file_name $!";
+			print $fh $data[2] or die "Failed to write $file_name $!";
+			close $fh or warn "Error closing $file_name: $!";
+		}
+	}
+
+	delete_nonmatching_sql_files($target_folder, \%files_referenced);
+
+}
+
+#First argument is a folder holding the database files
+#Second argument is a list with elements like: "type-folder/objectname.sql"
+sub delete_nonmatching_sql_files {
+	my ($obj_folder, $files_referenced)=@_;
+	opendir(my $dbdir, $obj_folder) or die "Failed opening $obj_folder";
+	foreach my $type_dir (readdir($dbdir)) {
+		my $full_type_dir="$obj_folder/$type_dir";
+		next unless -d $full_type_dir;
+		opendir(my $potential_deletes, $full_type_dir) or die "Failed opening $full_type_dir";
+		my @sql_files = map {"$type_dir/$_"}
+			(grep(/\.sql$/, readdir($potential_deletes)));
+		#Remove SQL files which we created (or would have) this run
+		@sql_files=grep(!defined %{$files_referenced}{$_}, @sql_files);
+		foreach (@sql_files) {
+			print "Deleting $obj_folder/$_\n" if DEBUG;
+			unlink "$obj_folder/$_" or warn "Failed to delete $obj_folder/$_";
+		}
+		closedir($potential_deletes);
+	}
+	closedir($dbdir);
+}
+
+sub do_git {
+	chdir shift;
+	system("/usr/bin/git", "add", ".")==0 or die "Failed to add to git - $?, $!";
+	
+}
+

@@ -1,0 +1,5 @@
+.*.sw[po]
+*~
+Thumbs.db
+/connect_info.dat
+
